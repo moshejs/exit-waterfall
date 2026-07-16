@@ -1,0 +1,26 @@
+{
+  "name": "exit-waterfall",
+  "version": "1.0.0",
+  "description": "Startup exit waterfall math — liquidation preference stacks (seniority/pari passu, Nx multiples), participating vs non-participating with caps, and the convert-or-not equilibrium. Zero dependencies.",
+  "keywords": ["waterfall", "liquidation-preference", "cap-table", "exit", "startup", "venture-capital", "participating-preferred", "m-and-a", "equity", "finance"],
+  "homepage": "https://moshemalka.com",
+  "repository": { "type": "git", "url": "git+https://github.com/moshejs/exit-waterfall.git" },
+  "bugs": "https://github.com/moshejs/exit-waterfall/issues",
+  "author": "Moshe Malka <hello@moshemalka.com> (https://moshemalka.com)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" } },
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts --clean",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": { "tsup": "^8.5.0", "typescript": "^5.8.0", "vitest": "^3.2.0" },
+  "engines": { "node": ">=18" }
+}
