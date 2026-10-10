@@ -2,8 +2,8 @@
  * exit-waterfall — liquidation-preference waterfalls for startup cap tables.
  *
  * Preference stacks (1x/Nx multiples, seniority tiers or pari passu),
- * participating vs non-participating preferred with participation caps, and
- * the conversion decision: each preferred class takes its preference path or
+ * participating vs non-participating preferred with participation caps,
+ * common and options (with strike prices), and the conversion decision: each preferred class takes its preference path or
  * converts to common, whichever pays more, solved to a stable equilibrium.
  *
  * Proceeds are always fully conserved: Σ distributions = proceeds.
@@ -35,6 +35,14 @@ export interface PreferredClass {
 export interface CommonClass {
   name: string;
   shares: number;
+  /**
+   * Exercise price per share, for options/warrants. Default 0 (common stock).
+   * A class with a strike only participates once the common price per share
+   * exceeds it, and receives `shares × (price − strike)` — the standard
+   * net-exercise / cash-out treatment, solved exactly (the aggregate exercise
+   * price raises the price for everyone, as in a treasury-method cash-out).
+   */
+  strike?: number;
 }
 
 export interface WaterfallInputs {
@@ -61,6 +69,12 @@ export interface Distribution {
 
 export interface WaterfallResult {
   distributions: Distribution[];
+  /**
+   * Value of one share of common in this exit (what converted preferred and
+   * participating preferred receive per share from the residual; options
+   * receive this minus their strike). 0 when the preferences absorb everything.
+   */
+  pricePerCommonShare: number;
   /** Names of preferred classes that converted. */
   converted: string[];
   totalDistributed: number;
@@ -73,14 +87,24 @@ function check(cond: boolean, msg: string): void {
 function validate(inputs: WaterfallInputs): void {
   check(Number.isFinite(inputs.proceeds) && inputs.proceeds >= 0, "proceeds must be ≥ 0");
   const names = new Set<string>();
+  let totalShares = 0;
   for (const p of [...inputs.preferred, ...inputs.common]) {
     check(!names.has(p.name), `duplicate class name "${p.name}"`);
     names.add(p.name);
-    check(p.shares >= 0, `${p.name}: shares must be ≥ 0`);
+    check(Number.isFinite(p.shares) && p.shares >= 0, `${p.name}: shares must be ≥ 0`);
+    totalShares += p.shares;
+  }
+  check(totalShares > 0, "at least one class must hold shares (otherwise residual proceeds have no owner)");
+  for (const c of inputs.common) {
+    check(
+      c.strike === undefined || (Number.isFinite(c.strike) && c.strike >= 0),
+      `${c.name}: strike must be ≥ 0`,
+    );
   }
   for (const p of inputs.preferred) {
-    check(p.invested > 0, `${p.name}: invested must be positive`);
-    check((p.preferenceMultiple ?? 1) > 0, `${p.name}: preferenceMultiple must be positive`);
+    check(Number.isFinite(p.invested) && p.invested > 0, `${p.name}: invested must be positive`);
+    const mult = p.preferenceMultiple ?? 1;
+    check(Number.isFinite(mult) && mult > 0, `${p.name}: preferenceMultiple must be positive`);
     check(
       p.participationCap === undefined || p.participationCap >= 1,
       `${p.name}: participationCap must be ≥ 1 (a multiple of invested)`,
@@ -97,14 +121,53 @@ interface Payout {
   fromParticipation: number;
 }
 
+interface Participant {
+  name: string;
+  shares: number;
+  /** Per-share threshold below which the participant receives nothing (option strike). */
+  strike: number;
+  /** Maximum it can receive from the residual (participation cap); Infinity if none. */
+  capacity: number;
+}
+
+/**
+ * Share `amount` among participants at a single common price per share p:
+ * participant i receives min(capacity_i, shares_i × max(0, p − strike_i)).
+ * The total is continuous, non-decreasing and piecewise linear in p, so p is
+ * solved exactly by walking the breakpoints (strikes and cap levels).
+ * Returns p (Infinity if every participant is capped below `amount`).
+ */
+function solveCommonPrice(participants: readonly Participant[], amount: number): number {
+  if (amount <= 0) return 0;
+  const events: { p: number; dSlope: number }[] = [];
+  for (const x of participants) {
+    if (x.shares <= 0 || x.capacity <= 0) continue;
+    events.push({ p: x.strike, dSlope: x.shares });
+    if (Number.isFinite(x.capacity)) events.push({ p: x.strike + x.capacity / x.shares, dSlope: -x.shares });
+  }
+  events.sort((a, b) => a.p - b.p);
+  let p = 0;
+  let value = 0;
+  let slope = 0;
+  for (const e of events) {
+    if (slope > 0 && value + slope * (e.p - p) >= amount) return p + (amount - value) / slope;
+    value += slope * (e.p - p);
+    p = e.p;
+    slope += e.dSlope;
+  }
+  return slope > 0 ? p + (amount - value) / slope : Infinity;
+}
+
+interface Distributed {
+  payouts: Map<string, Payout>;
+  pricePerCommonShare: number;
+}
+
 /**
  * Distribute proceeds for a FIXED set of conversion decisions.
  * Returns payouts per class name.
  */
-function distribute(
-  inputs: WaterfallInputs,
-  convertedSet: ReadonlySet<string>,
-): Map<string, Payout> {
+function distribute(inputs: WaterfallInputs, convertedSet: ReadonlySet<string>): Distributed {
   const payouts = new Map<string, Payout>();
   for (const p of inputs.preferred) payouts.set(p.name, { fromPreference: 0, fromParticipation: 0 });
   for (const c of inputs.common) payouts.set(c.name, { fromPreference: 0, fromParticipation: 0 });
@@ -126,62 +189,48 @@ function distribute(
     remaining -= pay;
   }
 
-  // 2. Residual: common + converted preferred (full shares) + participating
-  //    non-converted preferred, pro-rata by shares, with caps redistributed.
-  interface Participant {
-    name: string;
-    shares: number;
-    /** Remaining capacity before a participation cap binds; Infinity if none. */
-    capacity: number;
-  }
+  // 2. Residual: common (and options above their strike) + converted
+  //    preferred + participating non-converted preferred (up to its cap), all
+  //    at one common price per share.
   const participants: Participant[] = [];
   for (const c of inputs.common) {
-    if (c.shares > 0) participants.push({ name: c.name, shares: c.shares, capacity: Infinity });
+    participants.push({ name: c.name, shares: c.shares, strike: c.strike ?? 0, capacity: Infinity });
   }
   for (const p of inputs.preferred) {
     if (convertedSet.has(p.name)) {
-      if (p.shares > 0) participants.push({ name: p.name, shares: p.shares, capacity: Infinity });
-    } else if (p.participating && p.shares > 0) {
+      participants.push({ name: p.name, shares: p.shares, strike: 0, capacity: Infinity });
+    } else if (p.participating) {
       const already = payouts.get(p.name)!.fromPreference;
       const capTotal = p.participationCap === undefined ? Infinity : p.participationCap * p.invested;
-      participants.push({ name: p.name, shares: p.shares, capacity: Math.max(0, capTotal - already) });
+      participants.push({ name: p.name, shares: p.shares, strike: 0, capacity: Math.max(0, capTotal - already) });
     }
   }
 
-  // Iteratively distribute, fixing capped participants at their capacity.
-  let pool = participants.filter((x) => x.capacity > 0);
-  while (remaining > 1e-9 && pool.length > 0) {
-    const totalShares = pool.reduce((a, x) => a + x.shares, 0);
-    const perShare = remaining / totalShares;
-    // find participants whose cap binds at this rate
-    const binding = pool.filter((x) => x.shares * perShare > x.capacity);
-    if (binding.length === 0) {
-      for (const x of pool) payouts.get(x.name)!.fromParticipation += x.shares * perShare;
-      remaining = 0;
-      break;
+  let price = solveCommonPrice(participants, remaining);
+  if (Number.isFinite(price)) {
+    for (const x of participants) {
+      if (x.shares <= 0) continue;
+      payouts.get(x.name)!.fromParticipation = Math.min(x.capacity, x.shares * Math.max(0, price - x.strike));
     }
-    for (const x of binding) {
-      payouts.get(x.name)!.fromParticipation += x.capacity;
-      remaining -= x.capacity;
-      x.capacity = 0;
+  } else {
+    // Degenerate: every residual participant is a capped participating class
+    // (no common, options or converted shares). Pay caps, then share the
+    // excess pro-rata by shares so proceeds are conserved.
+    let paid = 0;
+    let shares = 0;
+    for (const x of participants) {
+      payouts.get(x.name)!.fromParticipation = x.capacity;
+      paid += x.capacity;
+      shares += x.shares;
     }
-    pool = pool.filter((x) => x.capacity > 0);
-  }
-  // If everyone is capped and money remains, it goes to unlimited participants;
-  // if none exist (degenerate: only capped participants), pay pro-rata anyway
-  // to conserve proceeds.
-  if (remaining > 1e-9) {
-    const everyone = participants.length ? participants : null;
-    if (everyone) {
-      const totalShares = everyone.reduce((a, x) => a + x.shares, 0);
-      if (totalShares > 0) {
-        for (const x of everyone) payouts.get(x.name)!.fromParticipation += (remaining * x.shares) / totalShares;
-        remaining = 0;
-      }
+    const excess = remaining - paid;
+    for (const x of participants) {
+      if (x.shares > 0) payouts.get(x.name)!.fromParticipation += (excess * x.shares) / shares;
     }
+    price = 0;
   }
 
-  return payouts;
+  return { payouts, pricePerCommonShare: price };
 }
 
 function totalFor(p: Payout): number {
@@ -189,10 +238,75 @@ function totalFor(p: Payout): number {
 }
 
 /**
+ * The conversion decisions: a Nash equilibrium in which no preferred class
+ * can strictly gain by switching (converting, or reverting to its
+ * preference), holding the others fixed.
+ *
+ * Solved by best-response dynamics from "nobody converts", scanning classes
+ * in ascending order of the per-share value at which converting starts to
+ * pay (preference ÷ shares, or cap ÷ shares for capped participating), so the
+ * result does not depend on input order. A switch can make an earlier
+ * converter want to revert (a conversion lowers the common price), which the
+ * dynamics handle. If they ever cycle, falls back to an exhaustive search
+ * for the equilibrium with the fewest conversions.
+ */
+function solveConversions(inputs: WaterfallInputs): Set<string> {
+  const eps = 1e-9 * Math.max(1, inputs.proceeds);
+  const threshold = (p: PreferredClass): number => {
+    if (p.participating && p.participationCap === undefined) return Infinity;
+    const base = p.participating ? p.participationCap! : (p.preferenceMultiple ?? 1);
+    return (base * p.invested) / p.shares;
+  };
+  // A class with no shares can never gain by converting.
+  const candidates = inputs.preferred
+    .map((p, i) => ({ p, i, t: threshold(p) }))
+    .filter((x) => x.p.shares > 0)
+    .sort((a, b) => a.t - b.t || a.i - b.i)
+    .map((x) => x.p);
+
+  const gain = (state: ReadonlySet<string>, name: string): number => {
+    const flipped = new Set(state);
+    if (flipped.has(name)) flipped.delete(name);
+    else flipped.add(name);
+    return (
+      totalFor(distribute(inputs, flipped).payouts.get(name)!) -
+      totalFor(distribute(inputs, state).payouts.get(name)!)
+    );
+  };
+  const isStable = (state: ReadonlySet<string>) => candidates.every((p) => gain(state, p.name) <= eps);
+
+  let state = new Set<string>();
+  const maxSteps = 4 * candidates.length * candidates.length + 16;
+  for (let step = 0; step < maxSteps; step++) {
+    const mover = candidates.find((p) => gain(state, p.name) > eps);
+    if (!mover) return state;
+    state = new Set(state);
+    if (state.has(mover.name)) state.delete(mover.name);
+    else state.add(mover.name);
+  }
+
+  check(candidates.length <= 16, "conversion decisions did not reach a stable equilibrium");
+  const subsets = Array.from({ length: 1 << candidates.length }, (_, m) => m).sort(
+    (a, b) => popcount(a) - popcount(b) || a - b,
+  );
+  for (const mask of subsets) {
+    const trial = new Set(candidates.filter((_, k) => mask & (1 << k)).map((p) => p.name));
+    if (isStable(trial)) return trial;
+  }
+  throw new RangeError("no stable set of conversion decisions exists for these terms");
+}
+
+function popcount(n: number): number {
+  let c = 0;
+  for (; n; n &= n - 1) c++;
+  return c;
+}
+
+/**
  * Solve the waterfall, including each preferred class's convert-or-preference
- * decision (iterated to a stable equilibrium: a class converts when taking
- * common treatment pays strictly more than its preference path, holding the
- * other classes' decisions fixed).
+ * decision (a stable equilibrium: no class can strictly gain by switching
+ * between its preference path and converting to common, holding the other
+ * classes' decisions fixed).
  *
  * ```ts
  * exitWaterfall({
@@ -205,26 +319,9 @@ function totalFor(p: Payout): number {
  */
 export function exitWaterfall(inputs: WaterfallInputs): WaterfallResult {
   validate(inputs);
-  const convertedSet = new Set<string>();
+  const convertedSet = solveConversions(inputs);
 
-  // Monotone iteration: once a class converts it never unconverts.
-  for (let iter = 0; iter < inputs.preferred.length + 1; iter++) {
-    const base = distribute(inputs, convertedSet);
-    let changed = false;
-    for (const p of inputs.preferred) {
-      if (convertedSet.has(p.name)) continue;
-      const trial = new Set(convertedSet);
-      trial.add(p.name);
-      const withConversion = distribute(inputs, trial);
-      if (totalFor(withConversion.get(p.name)!) > totalFor(base.get(p.name)!) + 1e-9) {
-        convertedSet.add(p.name);
-        changed = true;
-      }
-    }
-    if (!changed) break;
-  }
-
-  const final = distribute(inputs, convertedSet);
+  const { payouts: final, pricePerCommonShare } = distribute(inputs, convertedSet);
   const distributions: Distribution[] = [];
   for (const p of inputs.preferred) {
     const pay = final.get(p.name)!;
@@ -251,5 +348,10 @@ export function exitWaterfall(inputs: WaterfallInputs): WaterfallResult {
     });
   }
   const totalDistributed = distributions.reduce((a, d) => a + d.amount, 0);
-  return { distributions, converted: [...convertedSet], totalDistributed };
+  return {
+    distributions,
+    pricePerCommonShare,
+    converted: inputs.preferred.filter((p) => convertedSet.has(p.name)).map((p) => p.name),
+    totalDistributed,
+  };
 }
